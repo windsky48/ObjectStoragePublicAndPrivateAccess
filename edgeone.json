@@ -1,20 +1,20 @@
 {
     "functions": {
         "paths": {
-            "/api/b2": "edge-functions/api/b2.js",
-            "/": "edge-functions/index.js"
+            "/api/b2": "functions/api/b2.js",
+            "/": "functions/index.js"
         }
     },
     "routes": [
         {
             "path": "/api/b2",
             "method": ["GET", "HEAD", "OPTIONS"],
-            "function": "edge-functions/api/b2.js"
+            "function": "functions/api/b2.js"
         },
         {
             "path": "/",
             "method": ["GET"],
-            "function": "edge-functions/index.js"
+            "function": "functions/index.js"
         }
     ]
 }
