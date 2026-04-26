@@ -1,15 +1,20 @@
 {
-    "$schema": "https://framework.edgeone.app/schema.json",
-    "name": "objectstoragepublicandprivateaccess",
-    "version": "1.0.0",
     "functions": {
         "paths": {
             "/": "edge-functions/index.js",
             "/api/b2": "edge-functions/api/b2.js"
         }
     },
-    "build": {
-        "command": "",
-        "outputDirectory": "."
-    }
+    "routes": [
+        {
+            "path": "/api/b2",
+            "method": ["GET", "HEAD", "OPTIONS"],
+            "function": "edge-functions/api/b2.js"
+        },
+        {
+            "path": "/",
+            "method": ["GET"],
+            "function": "edge-functions/index.js"
+        }
+    ]
 }
