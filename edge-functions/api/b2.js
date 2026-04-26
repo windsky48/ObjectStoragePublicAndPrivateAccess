@@ -12,11 +12,33 @@
 // 2. 桶保持私有模式（private），不需要付那$1美元
 // 3. 客户端需要携带：X-API-Token、X-Timestamp、X-Signature 三个请求头
 
-export async function onRequest(context) {
+// ========== 处理 GET 和 HEAD 请求（核心功能）==========
+export async function onRequestGet(context) {
+    return handleRequest(context);
+}
+
+export async function onRequestHead(context) {
+    return handleRequest(context);
+}
+
+// ========== 处理 OPTIONS 预检请求（CORS）==========
+export async function onRequestOptions() {
+    return new Response(null, {
+        headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'X-API-Token, X-Timestamp, X-Signature, Content-Type',
+            'Access-Control-Max-Age': '86400'
+        }
+    });
+}
+
+// ========== 核心业务逻辑（复用于GET和HEAD）==========
+async function handleRequest(context) {
     const { request, env } = context;
     const url = new URL(request.url);
-    
-    // ========== 1. 获取请求的文件名 ==========
+
+    // 1. 获取请求的文件名
     const fileKey = url.searchParams.get('file');
     if (!fileKey) {
         return new Response(JSON.stringify({
@@ -33,13 +55,13 @@ export async function onRequest(context) {
         return new Response('非法文件名', { status: 400 });
     }
 
-    // ========== 2. 验证请求头（三重验证） ==========
+    // 2. 验证请求头（三重验证）
     const validationError = await validateRequest(request, env, fileKey);
     if (validationError) {
         return validationError;
     }
 
-    // ========== 3. 获取环境变量 ==========
+    // 3. 获取环境变量
     const keyId = env.B2_KEY_ID;
     const appKey = env.B2_APP_KEY;
     const bucketName = env.B2_BUCKET_NAME;
@@ -51,7 +73,7 @@ export async function onRequest(context) {
     }
 
     try {
-        // ========== 4. 调用 Backblaze B2 API 获取下载授权 ==========
+        // 4. 调用 Backblaze B2 API 获取下载授权
         const authUrl = 'https://api.backblazeb2.com/b2api/v2/b2_authorize_account';
         const authResponse = await fetch(authUrl, {
             headers: {
@@ -69,7 +91,7 @@ export async function onRequest(context) {
         const downloadUrl = authData.downloadUrl;
         const authorizationToken = authData.authorizationToken;
 
-        // 第五步：查询文件信息
+        // 5. 查询文件信息
         const fileQueryUrl = `${apiUrl}/b2api/v2/b2_list_file_names`;
         const listResponse = await fetch(fileQueryUrl, {
             method: 'POST',
@@ -90,7 +112,7 @@ export async function onRequest(context) {
 
         const listData = await listResponse.json();
         const files = listData.files;
-        
+
         if (!files || files.length === 0) {
             return new Response('文件不存在', { status: 404 });
         }
@@ -99,7 +121,7 @@ export async function onRequest(context) {
         const contentType = fileInfo.contentType || getContentType(fileKey);
         const fileSize = fileInfo.size;
 
-        // 第六步：获取文件
+        // 6. 获取文件
         const fileUrl = `${downloadUrl}/file/${bucketName}/${encodeURIComponent(fileKey)}`;
         const fileResponse = await fetch(fileUrl, {
             headers: {
@@ -111,7 +133,7 @@ export async function onRequest(context) {
             return new Response('文件获取失败', { status: 502 });
         }
 
-        // 第七步：返回文件内容
+        // 7. 返回文件内容
         return new Response(fileResponse.body, {
             headers: {
                 'Content-Type': contentType,
@@ -129,73 +151,69 @@ export async function onRequest(context) {
     }
 }
 
-// ========== 请求验证函数（三重验证） ==========
+// ========== 请求验证函数（三重验证）==========
 async function validateRequest(request, env, fileKey) {
     // 1. 验证 Token
     const expectedToken = env.API_SECRET_TOKEN;
     const receivedToken = request.headers.get('X-API-Token');
-    
+
     if (!expectedToken) {
         console.error('API_SECRET_TOKEN 未配置');
         return new Response('服务配置错误: 缺少 API 密钥配置', { status: 500 });
     }
-    
+
     if (!receivedToken || receivedToken !== expectedToken) {
-        return new Response('Unauthorized: Invalid or missing API token', { 
+        return new Response('Unauthorized: Invalid or missing API token', {
             status: 401,
             headers: { 'Content-Type': 'text/plain' }
         });
     }
-    
+
     // 2. 验证时间戳（防重放攻击）
     const timestamp = request.headers.get('X-Timestamp');
     if (!timestamp) {
-        return new Response('Unauthorized: Missing timestamp header', { 
+        return new Response('Unauthorized: Missing timestamp header', {
             status: 401,
             headers: { 'Content-Type': 'text/plain' }
         });
     }
-    
+
     const requestTime = parseInt(timestamp);
     const now = Date.now();
     const timeDiff = Math.abs(now - requestTime);
-    
-    // 时间差超过5分钟（300000毫秒）则拒绝
+
     if (isNaN(requestTime) || timeDiff > 300000) {
-        return new Response('Unauthorized: Request expired or invalid timestamp', { 
+        return new Response('Unauthorized: Request expired or invalid timestamp', {
             status: 401,
             headers: { 'Content-Type': 'text/plain' }
         });
     }
-    
+
     // 3. 验证签名
     const receivedSignature = request.headers.get('X-Signature');
     if (!receivedSignature) {
-        return new Response('Unauthorized: Missing signature header', { 
+        return new Response('Unauthorized: Missing signature header', {
             status: 401,
             headers: { 'Content-Type': 'text/plain' }
         });
     }
-    
-    // 计算期望的签名
+
     const salt = env.API_SECRET_SALT;
     if (!salt) {
         console.error('API_SECRET_SALT 未配置');
         return new Response('服务配置错误: 缺少签名盐值配置', { status: 500 });
     }
-    
+
     const dataToSign = `${expectedToken}|${timestamp}|${fileKey}`;
     const expectedSignature = await sha256(dataToSign + salt);
-    
-    // 使用 timing-safe 比较防止时序攻击
+
     if (!timingSafeEqual(expectedSignature, receivedSignature)) {
-        return new Response('Unauthorized: Invalid signature', { 
+        return new Response('Unauthorized: Invalid signature', {
             status: 401,
             headers: { 'Content-Type': 'text/plain' }
         });
     }
-    
-    // 所有验证通过
+
     return null;
 }
 
@@ -205,15 +223,12 @@ async function sha256(message) {
     const data = encoder.encode(message);
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    return hashHex;
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// ========== 时序安全比较函数（防止时序攻击） ==========
+// ========== 时序安全比较函数 ==========
 function timingSafeEqual(a, b) {
-    if (a.length !== b.length) {
-        return false;
-    }
+    if (a.length !== b.length) return false;
     let result = 0;
     for (let i = 0; i < a.length; i++) {
         result |= a.charCodeAt(i) ^ b.charCodeAt(i);
@@ -240,16 +255,4 @@ function getContentType(filename) {
         'html': 'text/html'
     };
     return types[ext] || 'application/octet-stream';
-}
-
-// ========== 处理 OPTIONS 预检请求（CORS） ==========
-export async function onRequestOptions() {
-    return new Response(null, {
-        headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-            'Access-Control-Allow-Headers': 'X-API-Token, X-Timestamp, X-Signature, Content-Type',
-            'Access-Control-Max-Age': '86400'
-        }
-    });
 }
