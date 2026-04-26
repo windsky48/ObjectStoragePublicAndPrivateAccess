@@ -5,10 +5,12 @@
 // 1. 在 EdgeOne Pages 控制台配置环境变量：
 //    - B2_KEY_ID: 你的 Backblaze Key ID
 //    - B2_APP_KEY: 你的 Backblaze Application Key
-//    - B2_BUCKET_NAME: 你的桶名（如 "my-bucket"）
-//    - B2_BUCKET_ID: 你的桶ID（在桶设置页面可以找到）
+//    - B2_BUCKET_NAME: 你的桶名
+//    - B2_BUCKET_ID: 你的桶ID
+//    - API_SECRET_TOKEN: API密钥（客户端请求时必须携带）
+//    - API_SECRET_SALT: 签名盐值（用于生成签名，与客户端保持一致）
 // 2. 桶保持私有模式（private），不需要付那$1美元
-// 3. 首次访问会从B2取文件，后续走EdgeOne边缘节点缓存
+// 3. 客户端需要携带：X-API-Token、X-Timestamp、X-Signature 三个请求头
 
 export async function onRequest(context) {
     const { request, env } = context;
@@ -26,12 +28,18 @@ export async function onRequest(context) {
         });
     }
 
-    // 安全检查：防止路径遍历攻击（如 ?file=../../config）
-    if (fileKey.includes('..') || fileKey.includes('\\')) {
+    // 安全检查：防止路径遍历攻击
+    if (fileKey.includes('..') || fileKey.includes('\\') || fileKey.includes('\0')) {
         return new Response('非法文件名', { status: 400 });
     }
 
-    // ========== 2. 获取环境变量 ==========
+    // ========== 2. 验证请求头（三重验证） ==========
+    const validationError = await validateRequest(request, env, fileKey);
+    if (validationError) {
+        return validationError;
+    }
+
+    // ========== 3. 获取环境变量 ==========
     const keyId = env.B2_KEY_ID;
     const appKey = env.B2_APP_KEY;
     const bucketName = env.B2_BUCKET_NAME;
@@ -43,8 +51,7 @@ export async function onRequest(context) {
     }
 
     try {
-        // ========== 3. 调用 Backblaze B2 API 获取下载授权 ==========
-        // 第一步：获取 B2 API 的基础 URL
+        // ========== 4. 调用 Backblaze B2 API 获取下载授权 ==========
         const authUrl = 'https://api.backblazeb2.com/b2api/v2/b2_authorize_account';
         const authResponse = await fetch(authUrl, {
             headers: {
@@ -62,11 +69,8 @@ export async function onRequest(context) {
         const downloadUrl = authData.downloadUrl;
         const authorizationToken = authData.authorizationToken;
 
-        // 第二步：获取文件信息（可选，用于获取文件大小、类型等）
-        const fileInfoUrl = `${apiUrl}/b2api/v2/b2_get_file_info`;
+        // 第五步：查询文件信息
         const fileQueryUrl = `${apiUrl}/b2api/v2/b2_list_file_names`;
-        
-        // 先列出文件找到对应的 fileId（如果知道 fileId 可以直接用）
         const listResponse = await fetch(fileQueryUrl, {
             method: 'POST',
             headers: {
@@ -95,11 +99,8 @@ export async function onRequest(context) {
         const contentType = fileInfo.contentType || getContentType(fileKey);
         const fileSize = fileInfo.size;
 
-        // 第三步：生成带授权的下载 URL
-        // 私有桶的下载格式：https://{downloadUrl}/file/{bucketName}/{fileName}
+        // 第六步：获取文件
         const fileUrl = `${downloadUrl}/file/${bucketName}/${encodeURIComponent(fileKey)}`;
-
-        // 第四步：代理请求文件
         const fileResponse = await fetch(fileUrl, {
             headers: {
                 'Authorization': authorizationToken
@@ -110,14 +111,14 @@ export async function onRequest(context) {
             return new Response('文件获取失败', { status: 502 });
         }
 
-        // 第五步：返回文件内容，带上缓存头（重要！让边缘节点缓存）
+        // 第七步：返回文件内容
         return new Response(fileResponse.body, {
             headers: {
                 'Content-Type': contentType,
                 'Content-Length': fileSize,
-                'Cache-Control': 'public, max-age=86400',  // 缓存24小时
-                'CDN-Cache-Control': 'public, max-age=604800', // 边缘节点缓存7天
-                'Access-Control-Allow-Origin': '*',       // 允许跨域（按需开启）
+                'Cache-Control': 'public, max-age=86400',
+                'CDN-Cache-Control': 'public, max-age=604800',
+                'Access-Control-Allow-Origin': '*',
                 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS'
             }
         });
@@ -126,6 +127,98 @@ export async function onRequest(context) {
         console.error('边缘函数错误:', error);
         return new Response('内部服务错误', { status: 500 });
     }
+}
+
+// ========== 请求验证函数（三重验证） ==========
+async function validateRequest(request, env, fileKey) {
+    // 1. 验证 Token
+    const expectedToken = env.API_SECRET_TOKEN;
+    const receivedToken = request.headers.get('X-API-Token');
+    
+    if (!expectedToken) {
+        console.error('API_SECRET_TOKEN 未配置');
+        return new Response('服务配置错误: 缺少 API 密钥配置', { status: 500 });
+    }
+    
+    if (!receivedToken || receivedToken !== expectedToken) {
+        return new Response('Unauthorized: Invalid or missing API token', { 
+            status: 401,
+            headers: { 'Content-Type': 'text/plain' }
+        });
+    }
+    
+    // 2. 验证时间戳（防重放攻击）
+    const timestamp = request.headers.get('X-Timestamp');
+    if (!timestamp) {
+        return new Response('Unauthorized: Missing timestamp header', { 
+            status: 401,
+            headers: { 'Content-Type': 'text/plain' }
+        });
+    }
+    
+    const requestTime = parseInt(timestamp);
+    const now = Date.now();
+    const timeDiff = Math.abs(now - requestTime);
+    
+    // 时间差超过5分钟（300000毫秒）则拒绝
+    if (isNaN(requestTime) || timeDiff > 300000) {
+        return new Response('Unauthorized: Request expired or invalid timestamp', { 
+            status: 401,
+            headers: { 'Content-Type': 'text/plain' }
+        });
+    }
+    
+    // 3. 验证签名
+    const receivedSignature = request.headers.get('X-Signature');
+    if (!receivedSignature) {
+        return new Response('Unauthorized: Missing signature header', { 
+            status: 401,
+            headers: { 'Content-Type': 'text/plain' }
+        });
+    }
+    
+    // 计算期望的签名
+    const salt = env.API_SECRET_SALT;
+    if (!salt) {
+        console.error('API_SECRET_SALT 未配置');
+        return new Response('服务配置错误: 缺少签名盐值配置', { status: 500 });
+    }
+    
+    const dataToSign = `${expectedToken}|${timestamp}|${fileKey}`;
+    const expectedSignature = await sha256(dataToSign + salt);
+    
+    // 使用 timing-safe 比较防止时序攻击
+    if (!timingSafeEqual(expectedSignature, receivedSignature)) {
+        return new Response('Unauthorized: Invalid signature', { 
+            status: 401,
+            headers: { 'Content-Type': 'text/plain' }
+        });
+    }
+    
+    // 所有验证通过
+    return null;
+}
+
+// ========== SHA-256 哈希函数 ==========
+async function sha256(message) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(message);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex;
+}
+
+// ========== 时序安全比较函数（防止时序攻击） ==========
+function timingSafeEqual(a, b) {
+    if (a.length !== b.length) {
+        return false;
+    }
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+        result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return result === 0;
 }
 
 // ========== 辅助函数：根据文件扩展名猜测 Content-Type ==========
@@ -155,7 +248,7 @@ export async function onRequestOptions() {
         headers: {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Allow-Headers': 'X-API-Token, X-Timestamp, X-Signature, Content-Type',
             'Access-Control-Max-Age': '86400'
         }
     });

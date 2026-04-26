@@ -132,10 +132,10 @@ export async function onRequest(context) {
 <body>
     <div class="card">
         <h1>
-            📦 B2 私有桶代理
+            📦 对象存储 私有桶代理
             <span class="badge">运行中</span>
         </h1>
-        <p style="color: #666;">通过 EdgeOne 边缘函数安全访问 Backblaze B2 私有存储桶</p>
+        <p style="color: #666;">通过 EdgeOne 边缘函数安全访问 对象存储 私有存储桶</p>
         
         <div class="status success">
             ✅ 服务正常 | 当前时间: ${beijingTime}

@@ -1,0 +1,8 @@
+{
+    "functions": {
+        "paths": {
+            "/": "edge-functions/index.js",
+            "/api/b2": "edge-functions/api/b2.js"
+        }
+    }
+}
